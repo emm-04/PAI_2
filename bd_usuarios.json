@@ -1,8 +1,0 @@
-{
-    "cliente_pas": {
-        "password": "123",
-        "rol": "PAS",
-        "certificado_asociado": "claves/cliente_pas.crt",
-        "estado": "ACTIVO"
-    }
-}
