@@ -15,7 +15,7 @@ import security
 
 CERT_DIR = BASE_DIR / "DB/certs"
 active_sessions = {}
-app = FastAPI(title = "U-Secure VPN API Gateway (Servidor Corporativo)", version = "2.0")
+app = FastAPI(title = "U-Secure VPN API Gateway (Servidor Corporativo)", version = "2.5")
 
 
 class RegisterRequest(BaseModel):
@@ -92,17 +92,42 @@ def register_user(reg: RegisterRequest, request: Request):
 @app.post("/api/v1/login")
 def login(creds: LoginRequest, request: Request):
     client_ip = request.client.host
+
+    if database.is_cert_revoked(creds.username):
+        database.log_audit_event("AUTH_BLOCKED_REVOKED", creds.username, client_ip, "Intento de login con certificado revocado")
+        raise HTTPException(status_code=403, detail="Acceso denegado: El certificado mTLS de este usuario ha sido revocado.")
     
     conn = database.get_connection()
     c = conn.cursor()
-    c.execute("SELECT role, salt, password_hash FROM users WHERE username = ?", (creds.username,))
+    c.execute("SELECT role, salt, password_hash, failed_attempts, lockout_until FROM users WHERE username = ?", (creds.username,))
     row = c.fetchone()
+    role, salt, password_hash, failed_attempts, lockout_until = row
+
+    
+    if not row:
+        conn.close()
+        database.log_audit_event("AUTH_FAILED", creds.username, client_ip, "No se ha encontrado al usuario.")
+        raise HTTPException(status_code = 401, detail = "No se ha encontrado al usuario.")
+
+    current_time = time.time()
+
+    if failed_attempts >= 3 and lockout_until is not None:
+        if current_time < lockout_until:
+            remaining_seconds = int(lockout_until - current_time)
+            conn.close()
+            raise HTTPException(status_code = 403, detail = f"Cuenta bloqueada por múltiples intentos fallidos. Inténtelo de nuevo en {remaining_seconds} segundos.")
+
+    
+    if not security.verify_password(row[1], row[2], creds.password):
+        if failed_attempts >= 2:
+            lockout_until = current_time + 300.0
+            c.execute("UPDATE users SET failed_attempts = failed_attempts + 1, lockout_until = ? WHERE username = ?", (lockout_until, creds.username,))
+            conn.commit()
+            conn.close()
+            raise HTTPException(status_code = 401, detail = "Credenciales inválidas")
+
     conn.close()
     
-    if not row or not security.verify_password(row[1], row[2], creds.password):
-        database.log_audit_event("AUTH_FAILED", creds.username, client_ip, "Credenciales inválidas")
-        raise HTTPException(status_code = 401, detail = "Credenciales inválidas")
-        
     token = security.secrets.token_hex(32)
     active_sessions[creds.username] = {"token": token, "role": row[0]}
     database.log_audit_event("AUTH_SUCCESS", creds.username, client_ip, "Login exitoso")
@@ -135,6 +160,11 @@ async def tunnel_data(request: Request,
     username = next((u for u, info in active_sessions.items() if info["token"] == token), None)
     if not username:
         raise HTTPException(status_code = 403, detail = "Sesión no válida")
+
+    if database.is_cert_revoked(username):
+        if username in active_sessions:
+            del active_sessions[username]
+        raise HTTPException(status_code=403, detail="Acceso revocado: El certificado del usuario ha sido invalidado.")
     
     try:
        req_time = float(x_timestamp) 
@@ -171,6 +201,37 @@ async def tunnel_data(request: Request,
     database.log_audit_event("TRAFFIC_TUNNEL", username, "Gateway", f"Datos íntegros procesados: {len(payload_content)} bytes")
     
     return {"status": "SUCCESS", "echo": f"[TÚNEL U-SECURE SEGURO + HMAC] Recibido e íntegro: {payload_content}"}
+
+@app.delete("/api/v1/users/{username}")
+def delete_and_revoke_user(username: str, request: Request, authorization: str = Header(None)):
+    """
+    Endpoint administrativo para eliminar una cuenta y revocar su certificado mTLS de forma permanente.
+    """
+    client_ip = request.client.host
+    
+    # Verificar si el certificado o usuario ya está revocado o no existe
+    conn = database.get_connection()
+    c = conn.cursor()
+    c.execute("SELECT username FROM users WHERE username = ?", (username,))
+    user_row = c.fetchone()
+    conn.close()
+    
+    if not user_row and not database.is_cert_revoked(username):
+        raise HTTPException(status_code = 404, detail="Usuario no encontrado en el sistema.")
+        
+    # 1. Revocar certificado y eliminar de usuarios
+    database.revoke_user_cert(username, reason = "Administrative Account Deletion")
+    
+    # 2. Destruir sesión activa si existía
+    if username in active_sessions:
+        del active_sessions[username]
+        
+    database.log_audit_event("CERT_REVOKED_ACCOUNT_DELETED", username, client_ip, f"Cuenta de usuario eliminada y certificado mTLS revocado.")
+    
+    return {
+        "status": "SUCCESS",
+        "message": f"Usuario '{username}' eliminado y su certificado mTLS ha sido revocado permanentemente."
+    }
 
 
 if __name__ == "__main__":

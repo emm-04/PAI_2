@@ -23,6 +23,8 @@ def init_db():
                     password_hash BLOB NOT NULL,
                     cert_cn TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    failed_attempts INTEGER DEFAULT 0,
+                    lockout_until REAL DEFAULT NULL,
                  )''')
 
 
@@ -43,6 +45,14 @@ def init_db():
                     timestamp INTEGER NOT NULL,
                     UNIQUE(nonce, timestamp)
                 )''')
+
+
+    #Tabla de revocaciones
+    c.execute('''CREATE TABLE IF NOT EXISTS revoked_certs (
+                    username TEXT PRIMARY KEY,
+                    revoked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    reason TEXT
+                 )''')
 
     conn.commit()
     conn.close()
@@ -67,3 +77,22 @@ def log_audit_event(event_type: str, username: str, client_ip: str, details: str
               (timestamp, event_type, username, client_ip, details))
     conn.commit()
     conn.close()
+
+def revoke_user_cert(username: str, reason: str = "Account Deleted / Revoked"):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    timestamp = datetime.now().isoformat()
+    c.execute("INSERT OR REPLACE INTO revoked_certs (username, revoked_at, reason) VALUES (?, ?, ?)",
+              (username, timestamp, reason))
+    
+    c.execute("DELETE FROM users WHERE username = ?", (username,))
+    conn.commit()
+    conn.close()
+
+def is_cert_revoked(username: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT username FROM revoked_certs WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
